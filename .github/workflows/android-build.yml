@@ -52,8 +52,9 @@ jobs:
 
       - name: Setup Android SDK
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          SDKMANAGER_BIN="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" -name sdkmanager | sort -V | tail -n 1)"
+          yes | "$SDKMANAGER_BIN" --licenses > /dev/null || true
+          "$SDKMANAGER_BIN" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Setup Gradle (Dependency Caching)
         uses: gradle/actions/setup-gradle@v4
@@ -128,7 +129,7 @@ jobs:
       - name: Verify APK Signatures & Generate SHA-256 Checksums
         working-directory: android
         run: |
-          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          APKSIGNER=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name apksigner | sort -V | tail -n 1)
           mkdir -p ../release-artifacts
           if compgen -G "app/build/outputs/apk/debug/*.apk" > /dev/null; then
             for apk in app/build/outputs/apk/debug/*.apk; do
@@ -144,7 +145,12 @@ jobs:
               cp "$apk" ../release-artifacts/DevForge-Studio-release.apk
             done
           fi
-          (cd ../release-artifacts && sha256sum *.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          if compgen -G "../release-artifacts/*.apk" > /dev/null; then
+            (cd ../release-artifacts && sha256sum *.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          else
+            echo "No APK files found in release-artifacts" >&2
+            exit 1
+          fi
 
       - name: Upload Debug APK Artifact
         if: ${{ inputs.build_variant != 'release' }}
