@@ -1,0 +1,6 @@
+{
+  "name": "DevForge Studio - The Ultimate Developer Swiss-Army Workbench",
+  "description": "High-performance, offline-capable developer suite featuring JWT debugger, JSON schema & type architect, cURL code generator, live regex lab, SQL formatter, cryptographic token tools, and cron builder.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,21 @@
+node_modules/
+build/
+dist/
+dev-dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Android / Capacitor Build Outputs & Signing Secrets
+android/.gradle/
+android/build/
+android/app/build/
+android/capacitor-cordova-android-plugins/build/
+android/local.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+release-artifacts/

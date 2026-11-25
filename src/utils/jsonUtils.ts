@@ -1,0 +1,317 @@
+/**
+ * JSON formatting, auto-repairing, code generation (TypeScript, Zod, Go, Pydantic),
+ * and structural diffing.
+ */
+
+export function repairJsonString(raw: string): string {
+  let cleaned = raw.trim();
+  
+  // Replace Python True/False/None with JSON standard true/false/null
+  cleaned = cleaned.replace(/\bNone\b/g, 'null');
+  cleaned = cleaned.replace(/\bTrue\b/g, 'true');
+  cleaned = cleaned.replace(/\bFalse\b/g, 'false');
+
+  // Replace single-quoted string values/keys with double quotes, handling escaped single quotes
+  cleaned = cleaned.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, match) => {
+    return `"${match.replace(/"/g, '\\"')}"`;
+  });
+
+  // Quote unquoted object keys (e.g. { foo: 1, bar_baz: "test" })
+  cleaned = cleaned.replace(/([{,]\s*)([a-zA-Z0-9_$-]+)\s*:/g, '$1"$2":');
+
+  // Remove trailing commas in objects and arrays
+  cleaned = cleaned.replace(/,\s*([}\]])/g, '$1');
+
+  // Validate if it parses cleanly
+  try {
+    const parsed = JSON.parse(cleaned);
+    return JSON.stringify(parsed, null, 2);
+  } catch (err) {
+    // Return the cleaned attempt even if partial
+    return cleaned;
+  }
+}
+
+export function formatJson(raw: string, space: number = 2): string {
+  const parsed = JSON.parse(raw);
+  return JSON.stringify(parsed, null, space);
+}
+
+export function minifyJson(raw: string): string {
+  const parsed = JSON.parse(raw);
+  return JSON.stringify(parsed);
+}
+
+// Convert JSON to TypeScript interface(s)
+export function jsonToTypeScript(json: unknown, rootName: string = 'RootObject'): string {
+  const interfaces: string[] = [];
+
+  function toPascalCase(str: string): string {
+    return str
+      .replace(/[-_](\w)/g, (_, c) => c.toUpperCase())
+      .replace(/^\w/, (c) => c.toUpperCase());
+  }
+
+  function getType(value: unknown, keyName: string): string {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    if (typeof value === 'string') return 'string';
+    if (typeof value === 'number') return 'number';
+    if (typeof value === 'boolean') return 'boolean';
+
+    if (Array.isArray(value)) {
+      if (value.length === 0) return 'unknown[]';
+      const itemType = getType(value[0], keyName + 'Item');
+      return `${itemType}[]`;
+    }
+
+    if (typeof value === 'object') {
+      const childInterfaceName = toPascalCase(keyName);
+      generateInterface(value as Record<string, unknown>, childInterfaceName);
+      return childInterfaceName;
+    }
+
+    return 'unknown';
+  }
+
+  function generateInterface(obj: Record<string, unknown>, name: string) {
+    const lines: string[] = [`export interface ${name} {`];
+    for (const [key, value] of Object.entries(obj)) {
+      const safeKey = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key) ? key : `"${key}"`;
+      const typeStr = getType(value, key);
+      lines.push(`  ${safeKey}: ${typeStr};`);
+    }
+    lines.push('}');
+    interfaces.push(lines.join('\n'));
+  }
+
+  if (typeof json === 'object' && json !== null) {
+    if (Array.isArray(json)) {
+      if (json.length > 0 && typeof json[0] === 'object' && json[0] !== null) {
+        generateInterface(json[0] as Record<string, unknown>, rootName);
+        return interfaces.reverse().join('\n\n') + `\n\nexport type ${rootName}List = ${rootName}[];`;
+      }
+      return `export type ${rootName} = unknown[];`;
+    }
+    generateInterface(json as Record<string, unknown>, rootName);
+    return interfaces.reverse().join('\n\n');
+  }
+
+  return `export type ${rootName} = ${typeof json};`;
+}
+
+// Convert JSON to Zod Schema
+export function jsonToZod(json: unknown, rootName: string = 'rootSchema'): string {
+  function getZodType(value: unknown, indent: string = '  '): string {
+    if (value === null) return 'z.null()';
+    if (typeof value === 'string') return 'z.string()';
+    if (typeof value === 'number') return Number.isInteger(value) ? 'z.number().int()' : 'z.number()';
+    if (typeof value === 'boolean') return 'z.boolean()';
+
+    if (Array.isArray(value)) {
+      if (value.length === 0) return 'z.array(z.unknown())';
+      return `z.array(${getZodType(value[0], indent)})`;
+    }
+
+    if (typeof value === 'object' && value !== null) {
+      const entries = Object.entries(value);
+      if (entries.length === 0) return 'z.record(z.unknown())';
+      const innerIndent = indent + '  ';
+      const lines = ['z.object({'];
+      for (const [k, v] of entries) {
+        const safeKey = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(k) ? k : `"${k}"`;
+        lines.push(`${innerIndent}${safeKey}: ${getZodType(v, innerIndent)},`);
+      }
+      lines.push(`${indent}})`);
+      return lines.join('\n');
+    }
+
+    return 'z.unknown()';
+  }
+
+  const schemaBody = getZodType(json, '');
+  return `import { z } from 'zod';\n\nexport const ${rootName} = ${schemaBody};\n\nexport type ${rootName.replace(/Schema$/i, '')} = z.infer<typeof ${rootName}>;`;
+}
+
+// Convert JSON to Go Struct
+export function jsonToGoStruct(json: unknown, rootName: string = 'AutoGenerated'): string {
+  const structs: string[] = [];
+
+  function toPascalCase(str: string): string {
+    return str
+      .replace(/[-_](\w)/g, (_, c) => c.toUpperCase())
+      .replace(/^\w/, (c) => c.toUpperCase());
+  }
+
+  function getGoType(value: unknown, fieldName: string): string {
+    if (value === null) return 'interface{}';
+    if (typeof value === 'string') return 'string';
+    if (typeof value === 'number') return Number.isInteger(value) ? 'int64' : 'float64';
+    if (typeof value === 'boolean') return 'bool';
+
+    if (Array.isArray(value)) {
+      if (value.length === 0) return '[]interface{}';
+      return `[]${getGoType(value[0], fieldName + 'Item')}`;
+    }
+
+    if (typeof value === 'object' && value !== null) {
+      const childStructName = toPascalCase(fieldName);
+      generateStruct(value as Record<string, unknown>, childStructName);
+      return childStructName;
+    }
+
+    return 'interface{}';
+  }
+
+  function generateStruct(obj: Record<string, unknown>, name: string) {
+    const lines = [`type ${name} struct {`];
+    for (const [key, val] of Object.entries(obj)) {
+      const fieldName = toPascalCase(key);
+      const goType = getGoType(val, key);
+      lines.push(`\t${fieldName.padEnd(20)} ${goType.padEnd(16)} \`json:"${key}"\``);
+    }
+    lines.push('}');
+    structs.push(lines.join('\n'));
+  }
+
+  if (typeof json === 'object' && json !== null) {
+    if (Array.isArray(json)) {
+      if (json.length > 0 && typeof json[0] === 'object' && json[0] !== null) {
+        generateStruct(json[0] as Record<string, unknown>, rootName);
+        return structs.reverse().join('\n\n');
+      }
+      return `type ${rootName} []interface{}`;
+    }
+    generateStruct(json as Record<string, unknown>, rootName);
+    return structs.reverse().join('\n\n');
+  }
+
+  return `type ${rootName} interface{}`;
+}
+
+// Convert JSON to Python Pydantic Model
+export function jsonToPydantic(json: unknown, rootName: string = 'AutoModel'): string {
+  const models: string[] = [];
+
+  function toPascalCase(str: string): string {
+    return str
+      .replace(/[-_](\w)/g, (_, c) => c.toUpperCase())
+      .replace(/^\w/, (c) => c.toUpperCase());
+  }
+
+  function getPyType(value: unknown, fieldName: string): string {
+    if (value === null) return 'Optional[Any]';
+    if (typeof value === 'string') return 'str';
+    if (typeof value === 'number') return Number.isInteger(value) ? 'int' : 'float';
+    if (typeof value === 'boolean') return 'bool';
+
+    if (Array.isArray(value)) {
+      if (value.length === 0) return 'List[Any]';
+      return `List[${getPyType(value[0], fieldName + 'Item')}]`;
+    }
+
+    if (typeof value === 'object' && value !== null) {
+      const childModelName = toPascalCase(fieldName);
+      generateModel(value as Record<string, unknown>, childModelName);
+      return childModelName;
+    }
+
+    return 'Any';
+  }
+
+  function generateModel(obj: Record<string, unknown>, name: string) {
+    const lines = [`class ${name}(BaseModel):`];
+    const entries = Object.entries(obj);
+    if (entries.length === 0) {
+      lines.push('    pass');
+    } else {
+      for (const [key, val] of entries) {
+        const pyType = getPyType(val, key);
+        lines.push(`    ${key}: ${pyType}`);
+      }
+    }
+    models.push(lines.join('\n'));
+  }
+
+  if (typeof json === 'object' && json !== null) {
+    if (Array.isArray(json)) {
+      if (json.length > 0 && typeof json[0] === 'object' && json[0] !== null) {
+        generateModel(json[0] as Record<string, unknown>, rootName);
+        return `from typing import List, Optional, Any\nfrom pydantic import BaseModel\n\n` + models.reverse().join('\n\n');
+      }
+      return `from typing import List, Any\n\n${rootName} = List[Any]`;
+    }
+    generateModel(json as Record<string, unknown>, rootName);
+    return `from typing import List, Optional, Any\nfrom pydantic import BaseModel\n\n` + models.reverse().join('\n\n');
+  }
+
+  return `from typing import Any\n\n${rootName} = Any`;
+}
+
+// JSON Diff representation
+export interface DiffItem {
+  path: string;
+  type: 'added' | 'removed' | 'changed' | 'unchanged';
+  oldValue?: unknown;
+  newValue?: unknown;
+}
+
+export function computeJsonDiff(objA: unknown, objB: unknown, currentPath: string = ''): DiffItem[] {
+  const diffs: DiffItem[] = [];
+
+  if (objA === objB) {
+    return [{ path: currentPath || 'root', type: 'unchanged', newValue: objA }];
+  }
+
+  const isObjA = typeof objA === 'object' && objA !== null;
+  const isObjB = typeof objB === 'object' && objB !== null;
+
+  if (!isObjA || !isObjB || Array.isArray(objA) !== Array.isArray(objB)) {
+    return [{ path: currentPath || 'root', type: 'changed', oldValue: objA, newValue: objB }];
+  }
+
+  const keysA = Object.keys(objA as Record<string, unknown>);
+  const keysB = Object.keys(objB as Record<string, unknown>);
+  const allKeys = Array.from(new Set([...keysA, ...keysB])).sort();
+
+  for (const k of allKeys) {
+    const path = currentPath ? `${currentPath}.${k}` : k;
+    const hasA = k in (objA as Record<string, unknown>);
+    const hasB = k in (objB as Record<string, unknown>);
+
+    if (hasA && !hasB) {
+      diffs.push({ path, type: 'removed', oldValue: (objA as Record<string, unknown>)[k] });
+    } else if (!hasA && hasB) {
+      diffs.push({ path, type: 'added', newValue: (objB as Record<string, unknown>)[k] });
+    } else {
+      const valA = (objA as Record<string, unknown>)[k];
+      const valB = (objB as Record<string, unknown>)[k];
+      if (typeof valA === 'object' && valA !== null && typeof valB === 'object' && valB !== null) {
+        diffs.push(...computeJsonDiff(valA, valB, path));
+      } else if (valA !== valB) {
+        diffs.push({ path, type: 'changed', oldValue: valA, newValue: valB });
+      }
+    }
+  }
+
+  return diffs;
+}
+
+// Safe JSONPath evaluation for queries like $.users[0].name or items.*.price
+export function evaluateJsonPath(data: unknown, path: string): unknown {
+  const cleanPath = path.trim().replace(/^\$\.?/, '');
+  if (!cleanPath) return data;
+
+  const parts = cleanPath.split(/\.|\[|\]/).filter(Boolean);
+  let current: unknown = data;
+
+  for (const part of parts) {
+    if (current === null || current === undefined) return undefined;
+    if (typeof current === 'object') {
+      current = (current as Record<string, unknown>)[part];
+    } else {
+      return undefined;
+    }
+  }
+  return current;
+}

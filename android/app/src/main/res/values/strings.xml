@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">DevForge Studio</string>
+    <string name="title_activity_main">DevForge Studio</string>
+    <string name="package_name">com.mwnext.devforgestudio</string>
+    <string name="custom_url_scheme">com.mwnext.devforgestudio</string>
+</resources>

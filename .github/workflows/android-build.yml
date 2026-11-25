@@ -1,0 +1,175 @@
+name: Android APK Build & Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: 'APK build variant'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - debug
+          - release
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android-apk:
+    name: Build, Sign & Package Android APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle (Dependency Caching)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
+      - name: Install npm dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Typecheck & Build Web Assets (PWA + Dist)
+        run: |
+          npm run lint
+          npm run build
+
+      - name: Initialize & Sync Capacitor Android Project
+        run: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          npx cap sync android
+
+      - name: Apply MW Next Icons, Splash & Manifest Hardening
+        run: bash scripts/configure-android-native.sh
+
+      - name: Resolve Gradle Dependencies
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:dependencies --configuration releaseRuntimeClasspath --no-daemon
+
+      - name: Build Debug APK
+        if: ${{ inputs.build_variant != 'release' }}
+        working-directory: android
+        run: |
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Build & Sign Release APK
+        id: release_apk
+        if: ${{ inputs.build_variant != 'debug' }}
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "==> Decoding release keystore from GitHub Secrets..."
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > app/release-keystore.jks
+            ./gradlew assembleRelease --no-daemon --stacktrace \
+              -Pandroid.injected.signing.store.file="$(pwd)/app/release-keystore.jks" \
+              -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+              -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+              -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD"
+            rm -f app/release-keystore.jks
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "==> No ANDROID_KEYSTORE_BASE64 secret configured; generating temporary CI keystore..."
+            keytool -genkeypair -v -keystore app/ci-temp-release.jks \
+              -alias devforge-ci -keyalg RSA -keysize 2048 -validity 365 \
+              -storepass devforgeci -keypass devforgeci \
+              -dname "CN=DevForge Studio, OU=MW Next, O=MW Next, C=TH"
+            ./gradlew assembleRelease --no-daemon --stacktrace \
+              -Pandroid.injected.signing.store.file="$(pwd)/app/ci-temp-release.jks" \
+              -Pandroid.injected.signing.store.password="devforgeci" \
+              -Pandroid.injected.signing.key.alias="devforge-ci" \
+              -Pandroid.injected.signing.key.password="devforgeci"
+            rm -f app/ci-temp-release.jks
+            echo "signed=ephemeral" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify APK Signatures & Generate SHA-256 Checksums
+        working-directory: android
+        run: |
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          mkdir -p ../release-artifacts
+          if compgen -G "app/build/outputs/apk/debug/*.apk" > /dev/null; then
+            for apk in app/build/outputs/apk/debug/*.apk; do
+              echo "==> Verifying $apk"
+              "$APKSIGNER" verify --print-certs "$apk"
+              cp "$apk" ../release-artifacts/DevForge-Studio-debug.apk
+            done
+          fi
+          if compgen -G "app/build/outputs/apk/release/*.apk" > /dev/null; then
+            for apk in app/build/outputs/apk/release/*.apk; do
+              echo "==> Verifying $apk"
+              "$APKSIGNER" verify --verbose --print-certs "$apk"
+              cp "$apk" ../release-artifacts/DevForge-Studio-release.apk
+            done
+          fi
+          (cd ../release-artifacts && sha256sum *.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Upload Debug APK Artifact
+        if: ${{ inputs.build_variant != 'release' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: DevForge-Studio-debug-apk
+          path: |
+            release-artifacts/DevForge-Studio-debug.apk
+            release-artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Upload Signed Release APK Artifact
+        if: ${{ inputs.build_variant != 'debug' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: DevForge-Studio-release-apk
+          path: |
+            release-artifacts/DevForge-Studio-release.apk
+            release-artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release on Version Tag (v*)
+        if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-artifacts/DevForge-Studio-debug.apk
+            release-artifacts/DevForge-Studio-release.apk
+            release-artifacts/SHA256SUMS.txt
